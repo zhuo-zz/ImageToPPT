@@ -1,36 +1,33 @@
 #pragma once
 
-#include <QImage>
+#include "ImageCanvas.h"
+
 #include <QMainWindow>
 
-class QLabel;
-class QPushButton;
-class QSpinBox;
-class QCheckBox;
+class QAction;
+class QListWidget;
 
-class PreviewWidget;
-
-class MainWindow : public QMainWindow
-{
+class MainWindow : public QMainWindow {
     Q_OBJECT
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
 
 private slots:
-    void chooseImage();
+    void openImage();
     void exportPptx();
-    void updatePreview();
+    void addRegion(const QRect &imageRect);
+    void editSelectedRegion();
+    void deleteSelectedRegion();
+    void refreshRegionList();
+    void onListSelectionChanged();
 
 private:
-    void updateControls();
+    QString regionLabel(const RegionItem &item, int index) const;
 
-    QImage image_;
-    QString imagePath_;
-    PreviewWidget *preview_ = nullptr;
-    QLabel *infoLabel_ = nullptr;
-    QSpinBox *rowsSpin_ = nullptr;
-    QSpinBox *colsSpin_ = nullptr;
-    QCheckBox *gapCheck_ = nullptr;
-    QPushButton *exportButton_ = nullptr;
+private:
+    ImageCanvas *m_canvas = nullptr;
+    QListWidget *m_regionList = nullptr;
+    QAction *m_backgroundAction = nullptr;
+    QString m_currentImagePath;
 };

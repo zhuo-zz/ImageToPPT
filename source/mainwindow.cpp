@@ -1,229 +1,199 @@
-#include "mainwindow.h"
+#include "MainWindow.h"
 
-#include "pptxexporter.h"
+#include "PptxExporter.h"
+#include "RegionDialog.h"
 
-#include <QCheckBox>
-#include <QDialog>
+#include <QAction>
 #include <QFileDialog>
-#include <QFileInfo>
 #include <QHBoxLayout>
-#include <QLabel>
+#include <QListWidget>
 #include <QMessageBox>
-#include <QMouseEvent>
-#include <QPainter>
 #include <QPushButton>
-#include <QSpinBox>
+#include <QSignalBlocker>
 #include <QStatusBar>
-#include <QTimer>
+#include <QToolBar>
 #include <QVBoxLayout>
 
-class PreviewWidget : public QWidget
+MainWindow::MainWindow(QWidget *parent)
+    : QMainWindow(parent)
 {
-public:
-    explicit PreviewWidget(QWidget *parent = nullptr) : QWidget(parent)
-    {
-        setMinimumSize(560, 420);
-        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-        setCursor(Qt::PointingHandCursor);
-    }
+    setWindowTitle(QStringLiteral("Image2PPT - 图片转 PPT 半自动重建工具"));
 
-    void setImage(const QImage &image)
-    {
-        image_ = image;
-        setCursor(image_.isNull() ? Qt::PointingHandCursor : Qt::ArrowCursor);
-        repaint();
-        update();
-    }
+    m_canvas = new ImageCanvas(this);
+    m_regionList = new QListWidget(this);
+    m_regionList->setMinimumWidth(260);
 
-    void setGrid(int rows, int columns)
-    {
-        rows_ = rows;
-        columns_ = columns;
-        update();
-    }
+    auto *editButton = new QPushButton(QStringLiteral("编辑选中区域"), this);
+    auto *deleteButton = new QPushButton(QStringLiteral("删除选中区域"), this);
 
-protected:
-    void paintEvent(QPaintEvent *) override
-    {
-        QPainter painter(this);
-        painter.fillRect(rect(), QColor(248, 249, 251));
-        painter.setRenderHint(QPainter::Antialiasing, true);
+    auto *sideLayout = new QVBoxLayout;
+    sideLayout->addWidget(m_regionList, 1);
+    sideLayout->addWidget(editButton);
+    sideLayout->addWidget(deleteButton);
 
-        if (image_.isNull()) {
-            painter.setPen(QColor(92, 99, 112));
-            painter.drawText(rect(), Qt::AlignCenter, tr("Click here or use Choose Image"));
-            return;
-        }
+    auto *side = new QWidget(this);
+    side->setLayout(sideLayout);
 
-        const QSize availableSize = size() - QSize(40, 40);
-        const QSize targetSize = image_.size().scaled(availableSize, Qt::KeepAspectRatio);
-        const QRect imageRect((width() - targetSize.width()) / 2,
-                              (height() - targetSize.height()) / 2,
-                              targetSize.width(),
-                              targetSize.height());
+    auto *mainLayout = new QHBoxLayout;
+    mainLayout->addWidget(m_canvas, 1);
+    mainLayout->addWidget(side);
 
-        painter.drawImage(imageRect, image_);
-        painter.setPen(QPen(QColor(20, 27, 38), 2));
-        painter.drawRect(imageRect.adjusted(0, 0, -1, -1));
-
-        painter.setPen(QPen(QColor(0, 122, 204, 210), 1));
-        for (int row = 1; row < rows_; ++row) {
-            const int y = imageRect.top() + imageRect.height() * row / rows_;
-            painter.drawLine(imageRect.left(), y, imageRect.right(), y);
-        }
-        for (int column = 1; column < columns_; ++column) {
-            const int x = imageRect.left() + imageRect.width() * column / columns_;
-            painter.drawLine(x, imageRect.top(), x, imageRect.bottom());
-        }
-    }
-
-    void mouseReleaseEvent(QMouseEvent *event) override
-    {
-        if (image_.isNull() && event->button() == Qt::LeftButton) {
-            QMetaObject::invokeMethod(window(), "chooseImage");
-        }
-        QWidget::mouseReleaseEvent(event);
-    }
-
-private:
-    QImage image_;
-    int rows_ = 3;
-    int columns_ = 3;
-};
-
-MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
-{
     auto *central = new QWidget(this);
-    auto *root = new QHBoxLayout(central);
-
-    preview_ = new PreviewWidget(central);
-    root->addWidget(preview_, 1);
-
-    auto *panel = new QWidget(central);
-    panel->setFixedWidth(310);
-    auto *panelLayout = new QVBoxLayout(panel);
-    panelLayout->setContentsMargins(18, 18, 18, 18);
-    panelLayout->setSpacing(14);
-
-    auto *title = new QLabel(tr("Image to PPTX units"), panel);
-    QFont titleFont = title->font();
-    titleFont.setPointSize(15);
-    titleFont.setBold(true);
-    title->setFont(titleFont);
-    panelLayout->addWidget(title);
-
-    auto *chooseButton = new QPushButton(tr("Choose Image"), panel);
-    panelLayout->addWidget(chooseButton);
-
-    infoLabel_ = new QLabel(tr("No image selected"), panel);
-    infoLabel_->setWordWrap(true);
-    panelLayout->addWidget(infoLabel_);
-
-    rowsSpin_ = new QSpinBox(panel);
-    rowsSpin_->setRange(1, 30);
-    rowsSpin_->setValue(3);
-    rowsSpin_->setPrefix(tr("Rows  "));
-    panelLayout->addWidget(rowsSpin_);
-
-    colsSpin_ = new QSpinBox(panel);
-    colsSpin_->setRange(1, 30);
-    colsSpin_->setValue(3);
-    colsSpin_->setPrefix(tr("Columns  "));
-    panelLayout->addWidget(colsSpin_);
-
-    gapCheck_ = new QCheckBox(tr("Add small gaps on export"), panel);
-    gapCheck_->setChecked(false);
-    panelLayout->addWidget(gapCheck_);
-
-    exportButton_ = new QPushButton(tr("Export PPTX"), panel);
-    exportButton_->setEnabled(false);
-    panelLayout->addWidget(exportButton_);
-    panelLayout->addStretch(1);
-    root->addWidget(panel);
-
+    central->setLayout(mainLayout);
     setCentralWidget(central);
-    setWindowTitle(tr("Image To Editable PPTX"));
-    statusBar()->showMessage(tr("Ready"));
 
-    connect(chooseButton, &QPushButton::clicked, this, &MainWindow::chooseImage);
-    connect(exportButton_, &QPushButton::clicked, this, &MainWindow::exportPptx);
-    connect(rowsSpin_, qOverload<int>(&QSpinBox::valueChanged), this, &MainWindow::updatePreview);
-    connect(colsSpin_, qOverload<int>(&QSpinBox::valueChanged), this, &MainWindow::updatePreview);
+    auto *openAction = new QAction(QStringLiteral("打开图片"), this);
+    auto *exportAction = new QAction(QStringLiteral("导出 PPTX"), this);
+    auto *clearAction = new QAction(QStringLiteral("清空区域"), this);
+    m_backgroundAction = new QAction(QStringLiteral("高保真背景"), this);
+    m_backgroundAction->setCheckable(true);
+    m_backgroundAction->setChecked(true);
+
+    auto *toolbar = addToolBar(QStringLiteral("工具栏"));
+    toolbar->addAction(openAction);
+    toolbar->addAction(exportAction);
+    toolbar->addAction(m_backgroundAction);
+    toolbar->addAction(clearAction);
+
+    connect(openAction, &QAction::triggered, this, &MainWindow::openImage);
+    connect(exportAction, &QAction::triggered, this, &MainWindow::exportPptx);
+    connect(clearAction, &QAction::triggered, m_canvas, &ImageCanvas::clearRegions);
+    connect(m_canvas, &ImageCanvas::regionCreated, this, &MainWindow::addRegion);
+    connect(m_canvas, &ImageCanvas::regionsChanged, this, &MainWindow::refreshRegionList);
+    connect(m_canvas, &ImageCanvas::selectionChanged, this, [this](int index) {
+        QSignalBlocker blocker(m_regionList);
+        m_regionList->setCurrentRow(index);
+    });
+    connect(editButton, &QPushButton::clicked, this, &MainWindow::editSelectedRegion);
+    connect(deleteButton, &QPushButton::clicked, this, &MainWindow::deleteSelectedRegion);
+    connect(m_regionList, &QListWidget::itemSelectionChanged, this, &MainWindow::onListSelectionChanged);
+
+    statusBar()->showMessage(QStringLiteral("打开图片后，用鼠标拖拽框选图片或文字区域"));
 }
 
-void MainWindow::chooseImage()
+void MainWindow::openImage()
 {
-    QFileDialog dialog(this, tr("Choose Image"));
-    dialog.setFileMode(QFileDialog::ExistingFile);
-    dialog.setNameFilters({tr("Images (*.png *.jpg *.jpeg *.bmp *.webp)"), tr("All files (*.*)")});
-    dialog.setOption(QFileDialog::DontUseNativeDialog, true);
+    const QString path = QFileDialog::getOpenFileName(
+        this,
+        QStringLiteral("选择图片"),
+        QString(),
+        QStringLiteral("Images (*.png *.jpg *.jpeg *.bmp)")
+    );
 
-    if (dialog.exec() != QDialog::Accepted) {
+    if (path.isEmpty())
+        return;
+
+    if (!m_canvas->loadImage(path)) {
+        QMessageBox::warning(this, QStringLiteral("打开失败"), QStringLiteral("无法读取该图片。"));
         return;
     }
 
-    const QString path = dialog.selectedFiles().value(0);
-    if (path.isEmpty()) {
-        return;
-    }
-
-    QImage loaded(path);
-    if (loaded.isNull()) {
-        QMessageBox::warning(this, tr("Open failed"), tr("This image could not be loaded."));
-        return;
-    }
-
-    image_ = loaded.convertToFormat(QImage::Format_ARGB32);
-    imagePath_ = path;
-    updateControls();
-    updatePreview();
-    QTimer::singleShot(0, preview_, qOverload<>(&QWidget::update));
-    statusBar()->showMessage(tr("Loaded image: %1").arg(path), 6000);
+    m_currentImagePath = path;
+    statusBar()->showMessage(QStringLiteral("已打开图片：%1").arg(path));
 }
 
 void MainWindow::exportPptx()
 {
-    if (image_.isNull()) {
+    if (m_canvas->image().isNull()) {
+        QMessageBox::information(this, QStringLiteral("提示"), QStringLiteral("请先打开一张图片。"));
         return;
     }
 
-    const QString output = QFileDialog::getSaveFileName(
+    if (m_canvas->regions().isEmpty()) {
+        QMessageBox::information(this, QStringLiteral("提示"), QStringLiteral("请至少框选一个区域。"));
+        return;
+    }
+
+    const QString path = QFileDialog::getSaveFileName(
         this,
-        tr("Export PPTX"),
-        QFileInfo(imagePath_).completeBaseName() + QStringLiteral("_split.pptx"),
-        tr("PowerPoint files (*.pptx)"));
-    if (output.isEmpty()) {
+        QStringLiteral("导出 PPTX"),
+        QStringLiteral("output.pptx"),
+        QStringLiteral("PowerPoint (*.pptx)")
+    );
+
+    if (path.isEmpty())
         return;
-    }
 
-    PptxExportOptions options;
-    options.rows = rowsSpin_->value();
-    options.columns = colsSpin_->value();
-    options.addSmallGaps = gapCheck_->isChecked();
-
+    PptxExporter exporter;
     QString error;
-    if (!PptxExporter::exportImageGrid(image_, output, options, &error)) {
-        QMessageBox::critical(this, tr("Export failed"), error);
+    if (!exporter.exportPptx(path,
+                             m_canvas->image(),
+                             m_canvas->regions(),
+                             m_backgroundAction->isChecked(),
+                             &error)) {
+        QMessageBox::critical(this, QStringLiteral("导出失败"), error);
         return;
     }
 
-    statusBar()->showMessage(tr("Exported: %1").arg(output), 6000);
-    QMessageBox::information(this,
-                             tr("Export complete"),
-                             tr("The PPTX has been created. Each tile is an independent selectable object."));
+    QMessageBox::information(this, QStringLiteral("导出成功"), QStringLiteral("PPTX 已生成：\n%1").arg(path));
 }
 
-void MainWindow::updatePreview()
+void MainWindow::addRegion(const QRect &imageRect)
 {
-    preview_->setGrid(rowsSpin_->value(), colsSpin_->value());
+    RegionItem item;
+    item.imageRect = imageRect;
+
+    RegionDialog dialog(this);
+    dialog.setRegion(item);
+    dialog.setOcrSource(m_canvas->image());
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+
+    QVector<RegionItem> regions = m_canvas->regions();
+    regions.append(dialog.region());
+    m_canvas->setRegions(regions);
 }
 
-void MainWindow::updateControls()
+void MainWindow::editSelectedRegion()
 {
-    infoLabel_->setText(tr("Selected: %1\nSize: %2 x %3 px\nClick Export PPTX to create the file.")
-                            .arg(imagePath_)
-                            .arg(image_.width())
-                            .arg(image_.height()));
-    exportButton_->setEnabled(!image_.isNull());
-    preview_->setImage(image_);
+    const int row = m_regionList->currentRow();
+    if (row < 0 || row >= m_canvas->regions().size())
+        return;
+
+    QVector<RegionItem> regions = m_canvas->regions();
+    RegionDialog dialog(this);
+    dialog.setRegion(regions.at(row));
+    dialog.setOcrSource(m_canvas->image());
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+
+    regions[row] = dialog.region();
+    m_canvas->setRegions(regions);
+    m_regionList->setCurrentRow(row);
+}
+
+void MainWindow::deleteSelectedRegion()
+{
+    m_canvas->removeSelectedRegion();
+}
+
+void MainWindow::refreshRegionList()
+{
+    const int oldRow = m_regionList->currentRow();
+    m_regionList->clear();
+
+    const auto &regions = m_canvas->regions();
+    for (int i = 0; i < regions.size(); ++i)
+        m_regionList->addItem(regionLabel(regions.at(i), i));
+
+    if (oldRow >= 0 && oldRow < regions.size())
+        m_regionList->setCurrentRow(oldRow);
+}
+
+void MainWindow::onListSelectionChanged()
+{
+    const int row = m_regionList->currentRow();
+    m_canvas->selectRegion(row);
+}
+
+QString MainWindow::regionLabel(const RegionItem &item, int index) const
+{
+    const QString type = item.type == RegionType::Image ? QStringLiteral("图片") : QStringLiteral("文字");
+    return QStringLiteral("%1. %2 [%3,%4 %5x%6]")
+        .arg(index + 1)
+        .arg(type)
+        .arg(item.imageRect.x())
+        .arg(item.imageRect.y())
+        .arg(item.imageRect.width())
+        .arg(item.imageRect.height());
 }
