@@ -4,9 +4,13 @@
 
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
+#include <QFont>
+#include <QPainter>
 #include <QProcess>
 #include <QTemporaryDir>
 #include <QTextStream>
+#include <QTextOption>
 #include <QtGlobal>
 
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
@@ -49,7 +53,7 @@ bool PptxExporter::exportPptx(const QString &outputPath,
 
     if (includeOriginalBackground) {
         const QString backgroundPath = root + QStringLiteral("/ppt/media/background.png");
-        const QImage cleanBackground = makeBackgroundWithoutText(sourceImage, regions);
+        const QImage cleanBackground = makeReconstructedBackground(sourceImage, regions);
         if (!cleanBackground.save(backgroundPath, "PNG")) {
             if (errorMessage)
                 *errorMessage = QStringLiteral("保存背景图失败。");
@@ -98,9 +102,25 @@ bool PptxExporter::exportPptx(const QString &outputPath,
     if (!writeTextFile(root + "/ppt/theme/theme1.xml", buildThemeXml(), errorMessage))
         return false;
 
-    QFile::remove(outputPath);
     const QString zipPath = outputPath + QStringLiteral(".zip");
-    QFile::remove(zipPath);
+    const QFileInfo outputInfo(outputPath);
+    if (!outputInfo.absoluteDir().exists() && !QDir().mkpath(outputInfo.absolutePath())) {
+        if (errorMessage)
+            *errorMessage = QStringLiteral("无法创建输出目录：\n%1").arg(outputInfo.absolutePath());
+        return false;
+    }
+
+    if (QFile::exists(outputPath) && !QFile::remove(outputPath)) {
+        if (errorMessage)
+            *errorMessage = QStringLiteral("无法覆盖输出文件：\n%1\n\n请先关闭正在打开这个 PPTX 的 PowerPoint/WPS/预览窗口，或换一个文件名再导出。").arg(outputPath);
+        return false;
+    }
+
+    if (QFile::exists(zipPath) && !QFile::remove(zipPath)) {
+        if (errorMessage)
+            *errorMessage = QStringLiteral("无法删除旧的临时 ZIP：\n%1\n\n请检查文件是否被占用，或换一个文件名再导出。").arg(zipPath);
+        return false;
+    }
 
     const QString nativeRoot = QDir::toNativeSeparators(root).replace("'", "''");
     const QString nativeZipPath = QDir::toNativeSeparators(zipPath).replace("'", "''");
@@ -139,6 +159,97 @@ bool PptxExporter::exportPptx(const QString &outputPath,
     }
 
     return true;
+}
+
+QImage PptxExporter::buildPreviewImage(const QImage &sourceImage,
+                                       const QVector<RegionItem> &regions,
+                                       bool includeOriginalBackground) const
+{
+    if (sourceImage.isNull())
+        return {};
+
+    QImage preview = includeOriginalBackground
+        ? makeReconstructedBackground(sourceImage, regions)
+        : QImage(sourceImage.size(), QImage::Format_ARGB32);
+    if (!includeOriginalBackground)
+        preview.fill(Qt::white);
+
+    QPainter painter(&preview);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setRenderHint(QPainter::TextAntialiasing);
+
+    for (const RegionItem &region : regions) {
+        const QRect rect = region.imageRect.intersected(sourceImage.rect());
+        if (rect.isEmpty())
+            continue;
+
+        if (region.type == RegionType::Image) {
+            painter.drawImage(rect, sourceImage.copy(rect));
+            continue;
+        }
+
+        QFont font(region.fontFamily.isEmpty() ? QStringLiteral("Microsoft YaHei") : region.fontFamily);
+        const int pixelSize = qBound(8, qRound(region.fontSize * sourceImage.width() / 960.0), 160);
+        font.setPixelSize(pixelSize);
+        font.setBold(region.bold);
+        painter.setFont(font);
+        painter.setPen(region.textColor);
+
+        QTextOption option;
+        option.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+        option.setAlignment(Qt::AlignLeft | Qt::AlignTop);
+        painter.drawText(QRectF(rect), region.text, option);
+    }
+
+    return preview;
+}
+
+bool PptxExporter::isSimpleBackgroundRegion(const QImage &sourceImage, const QRect &rect)
+{
+    const QRect bounded = rect.intersected(sourceImage.rect());
+    if (sourceImage.isNull() || bounded.isEmpty())
+        return false;
+
+    QVector<QColor> samples;
+    samples.reserve(bounded.width() * bounded.height());
+    const int step = qMax(1, qMin(bounded.width(), bounded.height()) / 80);
+    for (int y = bounded.top(); y <= bounded.bottom(); y += step) {
+        for (int x = bounded.left(); x <= bounded.right(); x += step)
+            samples.append(sourceImage.pixelColor(x, y));
+    }
+
+    const QColor center = medianColor(samples);
+    int nearCount = 0;
+    int distanceSum = 0;
+    for (const QColor &color : samples) {
+        const int distance = colorDistance(color, center);
+        distanceSum += qMin(distance, 255);
+        if (distance <= 54)
+            ++nearCount;
+    }
+
+    if (samples.isEmpty())
+        return false;
+
+    const double nearRatio = static_cast<double>(nearCount) / samples.size();
+    const double averageDistance = static_cast<double>(distanceSum) / samples.size();
+    return nearRatio >= 0.72 && averageDistance <= 48.0;
+}
+
+QColor PptxExporter::sampleRegionColor(const QImage &sourceImage, const QRect &rect)
+{
+    const QRect bounded = rect.intersected(sourceImage.rect());
+    if (sourceImage.isNull() || bounded.isEmpty())
+        return Qt::white;
+
+    QVector<QColor> colors;
+    const int step = qMax(1, qMin(bounded.width(), bounded.height()) / 60);
+    for (int y = bounded.top(); y <= bounded.bottom(); y += step) {
+        for (int x = bounded.left(); x <= bounded.right(); x += step)
+            colors.append(sourceImage.pixelColor(x, y));
+    }
+
+    return medianColor(colors);
 }
 
 qint64 PptxExporter::pxToEmu(int px, int imagePx, qint64 slideEmu)
@@ -203,24 +314,39 @@ bool PptxExporter::copyImageRegion(const QString &path, const QImage &sourceImag
     return true;
 }
 
-QImage PptxExporter::makeBackgroundWithoutText(const QImage &sourceImage, const QVector<RegionItem> &regions)
+QImage PptxExporter::makeReconstructedBackground(const QImage &sourceImage, const QVector<RegionItem> &regions)
 {
     QImage background = sourceImage.convertToFormat(QImage::Format_ARGB32);
 
     for (const RegionItem &region : regions) {
-        if (region.type != RegionType::Text)
-            continue;
-
         QRect rect = region.imageRect.intersected(background.rect());
         if (rect.isEmpty())
             continue;
 
-        // Slightly enlarge the erase area so anti-aliased character edges do not remain.
-        rect = rect.adjusted(-3, -3, 3, 3).intersected(background.rect());
-        fillRemovedTextRegion(background, rect);
+        if (region.type == RegionType::Image) {
+            const QRect removalRect = backgroundRemovalRectForImageRegion(sourceImage, rect);
+            if (region.hasImageBackgroundColor) {
+                QPainter painter(&background);
+                painter.fillRect(removalRect, region.imageBackgroundColor);
+            } else {
+                fillRemovedImageRegion(background, removalRect);
+            }
+        } else {
+            fillRemovedTextRegion(background, rect);
+        }
     }
 
     return background;
+}
+
+QRect PptxExporter::backgroundRemovalRectForImageRegion(const QImage &sourceImage, const QRect &rect)
+{
+    const QRect bounded = rect.intersected(sourceImage.rect());
+    if (sourceImage.isNull() || bounded.isEmpty())
+        return {};
+
+    const int bleed = 2;
+    return bounded.adjusted(-bleed, -bleed, bleed, bleed).intersected(sourceImage.rect());
 }
 
 QVector<QColor> PptxExporter::sampleStripColors(const QImage &image, const QRect &strip)
@@ -264,6 +390,21 @@ QColor PptxExporter::medianColor(QVector<QColor> colors)
     return QColor(median(reds), median(greens), median(blues));
 }
 
+QColor PptxExporter::medianColor(QVector<QColor> colors, const QColor &fallback)
+{
+    if (colors.isEmpty())
+        return fallback;
+
+    return medianColor(colors);
+}
+
+int PptxExporter::colorDistance(const QColor &a, const QColor &b)
+{
+    return qAbs(a.red() - b.red())
+        + qAbs(a.green() - b.green())
+        + qAbs(a.blue() - b.blue());
+}
+
 QColor PptxExporter::mixColor(const QColor &a, const QColor &b, double t)
 {
     t = qBound(0.0, t, 1.0);
@@ -274,50 +415,414 @@ QColor PptxExporter::mixColor(const QColor &a, const QColor &b, double t)
     );
 }
 
+bool PptxExporter::isConsistentColorSet(const QVector<QColor> &colors, const QColor &center, int maxAverageDistance, double minNearRatio)
+{
+    if (colors.isEmpty())
+        return false;
+
+    int nearCount = 0;
+    int distanceSum = 0;
+    for (const QColor &color : colors) {
+        const int distance = colorDistance(color, center);
+        distanceSum += qMin(distance, 255);
+        if (distance <= maxAverageDistance * 2)
+            ++nearCount;
+    }
+
+    const double nearRatio = static_cast<double>(nearCount) / colors.size();
+    const double averageDistance = static_cast<double>(distanceSum) / colors.size();
+    return nearRatio >= minNearRatio && averageDistance <= maxAverageDistance;
+}
+
+void PptxExporter::fillRemovedImageRegion(QImage &image, const QRect &rect)
+{
+    const QRect bounded = rect.intersected(image.rect());
+    if (bounded.isEmpty())
+        return;
+
+    const QImage original = image.copy();
+    const int margin = qBound(12, qMin(bounded.width(), bounded.height()) / 5, 42);
+    const int rowRadius = qBound(2, bounded.height() / 24, 8);
+    const int columnRadius = qBound(2, bounded.width() / 24, 8);
+
+    QVector<QColor> ringColors;
+    ringColors += sampleStripColors(original, QRect(bounded.left() - margin, bounded.top(), margin, bounded.height()));
+    ringColors += sampleStripColors(original, QRect(bounded.right() + 1, bounded.top(), margin, bounded.height()));
+    ringColors += sampleStripColors(original, QRect(bounded.left(), bounded.top() - margin, bounded.width(), margin));
+    ringColors += sampleStripColors(original, QRect(bounded.left(), bounded.bottom() + 1, bounded.width(), margin));
+    const QColor fallback = medianColor(ringColors, medianColor(sampleStripColors(original, bounded)));
+    if (isConsistentColorSet(ringColors, fallback, 18, 0.82)) {
+        QPainter painter(&image);
+        painter.fillRect(bounded, fallback);
+        return;
+    }
+
+    QVector<QColor> topColors;
+    QVector<QColor> bottomColors;
+    topColors.reserve(bounded.width());
+    bottomColors.reserve(bounded.width());
+    for (int x = bounded.left(); x <= bounded.right(); ++x) {
+        topColors.append(medianColor(
+            sampleStripColors(original, QRect(x - columnRadius, bounded.top() - margin, columnRadius * 2 + 1, margin)),
+            fallback
+        ));
+        bottomColors.append(medianColor(
+            sampleStripColors(original, QRect(x - columnRadius, bounded.bottom() + 1, columnRadius * 2 + 1, margin)),
+            fallback
+        ));
+    }
+
+    for (int y = bounded.top(); y <= bounded.bottom(); ++y) {
+        const double ty = bounded.height() <= 1
+            ? 0.0
+            : static_cast<double>(y - bounded.top()) / (bounded.height() - 1);
+
+        const QColor leftColor = medianColor(
+            sampleStripColors(original, QRect(bounded.left() - margin, y - rowRadius, margin, rowRadius * 2 + 1)),
+            fallback
+        );
+        const QColor rightColor = medianColor(
+            sampleStripColors(original, QRect(bounded.right() + 1, y - rowRadius, margin, rowRadius * 2 + 1)),
+            fallback
+        );
+
+        for (int x = bounded.left(); x <= bounded.right(); ++x) {
+            const double tx = bounded.width() <= 1
+                ? 0.0
+                : static_cast<double>(x - bounded.left()) / (bounded.width() - 1);
+
+            const QColor horizontal = mixColor(leftColor, rightColor, tx);
+            const QColor vertical = mixColor(topColors.at(x - bounded.left()), bottomColors.at(x - bounded.left()), ty);
+            const QColor repaired = mixColor(horizontal, vertical, 0.52);
+            image.setPixelColor(x, y, repaired);
+        }
+    }
+}
+
 void PptxExporter::fillRemovedTextRegion(QImage &image, const QRect &rect)
 {
     const QRect bounded = rect.intersected(image.rect());
     if (bounded.isEmpty())
         return;
 
-    const int margin = qBound(6, qMin(bounded.width(), bounded.height()) / 8, 24);
+    const QImage original = image.copy();
+    const int margin = qBound(8, qMin(bounded.width(), bounded.height()) / 5, 32);
+    const int rowRadius = qBound(1, bounded.height() / 28, 4);
+    const int columnRadius = qBound(1, bounded.width() / 28, 4);
+    const int localRadius = qBound(2, qMin(bounded.width(), bounded.height()) / 16, 6);
 
-    const QColor leftColor = medianColor(sampleStripColors(
-        image,
-        QRect(bounded.left() - margin, bounded.top(), margin, bounded.height())
-    ));
-    const QColor rightColor = medianColor(sampleStripColors(
-        image,
-        QRect(bounded.right() + 1, bounded.top(), margin, bounded.height())
-    ));
-    const QColor topColor = medianColor(sampleStripColors(
-        image,
-        QRect(bounded.left(), bounded.top() - margin, bounded.width(), margin)
-    ));
-    const QColor bottomColor = medianColor(sampleStripColors(
-        image,
-        QRect(bounded.left(), bounded.bottom() + 1, bounded.width(), margin)
-    ));
+    QVector<QColor> ringColors;
+    ringColors += sampleStripColors(original, QRect(bounded.left() - margin, bounded.top(), margin, bounded.height()));
+    ringColors += sampleStripColors(original, QRect(bounded.right() + 1, bounded.top(), margin, bounded.height()));
+    ringColors += sampleStripColors(original, QRect(bounded.left(), bounded.top() - margin, bounded.width(), margin));
+    ringColors += sampleStripColors(original, QRect(bounded.left(), bounded.bottom() + 1, bounded.width(), margin));
+    const QColor fallback = medianColor(ringColors, medianColor(sampleStripColors(original, bounded)));
+    int ringNearCount = 0;
+    int ringDistanceSum = 0;
+    for (const QColor &color : ringColors) {
+        const int distance = colorDistance(color, fallback);
+        ringDistanceSum += distance;
+        if (distance <= 48)
+            ++ringNearCount;
+    }
+    const bool simpleSurroundingBackground = ringColors.size() >= qMax(16, bounded.width() + bounded.height())
+        && static_cast<double>(ringNearCount) / ringColors.size() >= 0.78
+        && static_cast<double>(ringDistanceSum) / ringColors.size() <= 34.0;
 
-    QColor fallback = medianColor(sampleStripColors(image, bounded.adjusted(-margin, -margin, margin, margin)));
+    QVector<QColor> estimatedFill;
+    estimatedFill.reserve(bounded.width() * bounded.height());
+
+    QVector<QColor> topColors;
+    QVector<QColor> bottomColors;
+    topColors.reserve(bounded.width());
+    bottomColors.reserve(bounded.width());
+    for (int x = bounded.left(); x <= bounded.right(); ++x) {
+        topColors.append(medianColor(
+            sampleStripColors(original, QRect(x - columnRadius, bounded.top() - margin, columnRadius * 2 + 1, margin)),
+            fallback
+        ));
+        bottomColors.append(medianColor(
+            sampleStripColors(original, QRect(x - columnRadius, bounded.bottom() + 1, columnRadius * 2 + 1, margin)),
+            fallback
+        ));
+    }
 
     for (int y = bounded.top(); y <= bounded.bottom(); ++y) {
         const double ty = bounded.height() <= 1
             ? 0.0
             : static_cast<double>(y - bounded.top()) / (bounded.height() - 1);
+
+        const QColor leftColor = medianColor(
+            sampleStripColors(original, QRect(bounded.left() - margin, y - rowRadius, margin, rowRadius * 2 + 1)),
+            fallback
+        );
+        const QColor rightColor = medianColor(
+            sampleStripColors(original, QRect(bounded.right() + 1, y - rowRadius, margin, rowRadius * 2 + 1)),
+            fallback
+        );
+
         for (int x = bounded.left(); x <= bounded.right(); ++x) {
             const double tx = bounded.width() <= 1
                 ? 0.0
                 : static_cast<double>(x - bounded.left()) / (bounded.width() - 1);
 
             QColor horizontal = mixColor(leftColor, rightColor, tx);
-            QColor vertical = mixColor(topColor, bottomColor, ty);
-            QColor mixed = mixColor(horizontal, vertical, 0.5);
+            QColor vertical = mixColor(topColors.at(x - bounded.left()), bottomColors.at(x - bounded.left()), ty);
+            estimatedFill.append(mixColor(horizontal, vertical, 0.5));
+        }
+    }
 
-            // If a strip is out of image bounds, its median becomes white. Blend back toward the
-            // surrounding fallback color so edge selections do not create a harsh white patch.
-            mixed = mixColor(mixed, fallback, 0.25);
-            image.setPixelColor(x, y, mixed);
+    const int width = bounded.width();
+    const int height = bounded.height();
+    QVector<uchar> textMask(width * height, 0);
+    QVector<int> luminances;
+    luminances.reserve(width * height);
+    for (int y = bounded.top(); y <= bounded.bottom(); ++y) {
+        for (int x = bounded.left(); x <= bounded.right(); ++x) {
+            const QColor pixel = original.pixelColor(x, y);
+            luminances.append(qRound(pixel.red() * 0.299 + pixel.green() * 0.587 + pixel.blue() * 0.114));
+        }
+    }
+    std::sort(luminances.begin(), luminances.end());
+
+    auto luminance = [](const QColor &color) {
+        return qRound(color.red() * 0.299 + color.green() * 0.587 + color.blue() * 0.114);
+    };
+
+    const int lowLum = luminances.at(qBound(0, luminances.size() / 10, luminances.size() - 1));
+    const int highLum = luminances.at(qBound(0, luminances.size() * 9 / 10, luminances.size() - 1));
+    const int backgroundLum = luminance(fallback);
+    const bool hasDarkText = lowLum < backgroundLum - 22;
+    const bool hasLightText = highLum > backgroundLum + 28;
+    const int strongThreshold = 118;
+    const int weakThreshold = 58;
+
+    QVector<int> dominantBuckets(4096, 0);
+    for (int y = bounded.top(); y <= bounded.bottom(); ++y) {
+        for (int x = bounded.left(); x <= bounded.right(); ++x) {
+            const QColor pixel = original.pixelColor(x, y);
+            const int key = ((pixel.red() >> 4) << 8) | ((pixel.green() >> 4) << 4) | (pixel.blue() >> 4);
+            ++dominantBuckets[key];
+        }
+    }
+
+    int dominantKey = 0;
+    int dominantCount = 0;
+    for (int i = 0; i < dominantBuckets.size(); ++i) {
+        if (dominantBuckets.at(i) > dominantCount) {
+            dominantCount = dominantBuckets.at(i);
+            dominantKey = i;
+        }
+    }
+
+    QVector<QColor> dominantColors;
+    dominantColors.reserve(dominantCount);
+    for (int y = bounded.top(); y <= bounded.bottom(); ++y) {
+        for (int x = bounded.left(); x <= bounded.right(); ++x) {
+            const QColor pixel = original.pixelColor(x, y);
+            const int key = ((pixel.red() >> 4) << 8) | ((pixel.green() >> 4) << 4) | (pixel.blue() >> 4);
+            if (key == dominantKey)
+                dominantColors.append(pixel);
+        }
+    }
+
+    const QColor dominantBackground = medianColor(dominantColors, fallback);
+    int dominantNearCount = 0;
+    int dominantDistanceSum = 0;
+    for (int y = bounded.top(); y <= bounded.bottom(); ++y) {
+        for (int x = bounded.left(); x <= bounded.right(); ++x) {
+            const int distance = colorDistance(original.pixelColor(x, y), dominantBackground);
+            dominantDistanceSum += qMin(distance, 180);
+            if (distance <= 54)
+                ++dominantNearCount;
+        }
+    }
+    const int pixelCount = width * height;
+    const double dominantRatio = pixelCount == 0 ? 0.0 : static_cast<double>(dominantCount) / pixelCount;
+    const double dominantNearRatio = pixelCount == 0 ? 0.0 : static_cast<double>(dominantNearCount) / pixelCount;
+    const double dominantAverageDistance = pixelCount == 0 ? 999.0 : static_cast<double>(dominantDistanceSum) / pixelCount;
+    const bool dominantColorBackground = dominantRatio >= 0.18
+        && dominantNearRatio >= 0.48
+        && dominantAverageDistance <= 82.0;
+
+    for (int y = bounded.top(); y <= bounded.bottom(); ++y) {
+        for (int x = bounded.left(); x <= bounded.right(); ++x) {
+            const int index = (y - bounded.top()) * width + (x - bounded.left());
+            const QColor pixel = original.pixelColor(x, y);
+            const QColor localBackground = medianColor(
+                sampleStripColors(original, QRect(x - localRadius, y - localRadius, localRadius * 2 + 1, localRadius * 2 + 1)),
+                estimatedFill.at(index)
+            );
+
+            const int localDistance = colorDistance(pixel, localBackground);
+            const int fillDistance = colorDistance(pixel, estimatedFill.at(index));
+            const int lum = luminance(pixel);
+            const int localLum = luminance(localBackground);
+            const int fillLum = luminance(estimatedFill.at(index));
+            const bool darkForeground = hasDarkText
+                && (lum <= localLum - 18 || lum <= fillLum - 20 || lum <= qMin(lowLum + 24, backgroundLum - 18));
+            const bool lightForeground = hasLightText
+                && (lum >= localLum + 22 || lum >= fillLum + 24 || lum >= qMax(highLum - 24, backgroundLum + 22));
+            const bool strongForeground = (darkForeground || lightForeground)
+                && qMax(localDistance, fillDistance) >= strongThreshold;
+            const bool weakSmallTextForeground = (darkForeground || lightForeground)
+                && qMax(localDistance, fillDistance) >= weakThreshold
+                && qAbs(lum - localLum) >= 16;
+            const bool largeGlyphForeground = (simpleSurroundingBackground || dominantColorBackground)
+                && qMax(fillDistance, qMax(colorDistance(pixel, fallback), colorDistance(pixel, dominantBackground))) >= 74
+                && qAbs(lum - backgroundLum) >= 16;
+
+            if (strongForeground || weakSmallTextForeground || largeGlyphForeground)
+                textMask[index] = 1;
+        }
+    }
+
+    QVector<uchar> visited(width * height, 0);
+    const int maxTextComponentArea = qMax(24, width * height / 14);
+    for (int start = 0; start < textMask.size(); ++start) {
+        if (!textMask.at(start) || visited.at(start))
+            continue;
+
+        QVector<int> stack;
+        QVector<int> component;
+        stack.append(start);
+        visited[start] = 1;
+
+        int minX = width;
+        int minY = height;
+        int maxX = 0;
+        int maxY = 0;
+
+        while (!stack.isEmpty()) {
+            const int current = stack.takeLast();
+            component.append(current);
+            const int cx = current % width;
+            const int cy = current / width;
+            minX = qMin(minX, cx);
+            minY = qMin(minY, cy);
+            maxX = qMax(maxX, cx);
+            maxY = qMax(maxY, cy);
+
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0)
+                        continue;
+
+                    const int nx = cx + dx;
+                    const int ny = cy + dy;
+                    if (nx < 0 || nx >= width || ny < 0 || ny >= height)
+                        continue;
+
+                    const int next = ny * width + nx;
+                    if (!textMask.at(next) || visited.at(next))
+                        continue;
+
+                    visited[next] = 1;
+                    stack.append(next);
+                }
+            }
+        }
+
+        const int componentWidth = maxX - minX + 1;
+        const int componentHeight = maxY - minY + 1;
+        const bool tooLarge = !simpleSurroundingBackground && component.size() > maxTextComponentArea;
+        const bool textureLike = !simpleSurroundingBackground && componentWidth > width * 0.72 && componentHeight > height * 0.32;
+        if (tooLarge || textureLike) {
+            for (int index : component)
+                textMask[index] = 0;
+        }
+    }
+
+    QVector<QColor> backgroundSamples;
+    backgroundSamples.reserve(width * height);
+    for (int y = bounded.top(); y <= bounded.bottom(); ++y) {
+        for (int x = bounded.left(); x <= bounded.right(); ++x) {
+            const int index = (y - bounded.top()) * width + (x - bounded.left());
+            if (!textMask.at(index))
+                backgroundSamples.append(original.pixelColor(x, y));
+        }
+    }
+
+    const QColor flatBackground = medianColor(backgroundSamples, fallback);
+    int flatNearCount = 0;
+    int flatDistanceSum = 0;
+    for (const QColor &color : backgroundSamples) {
+        const int distance = colorDistance(color, flatBackground);
+        flatDistanceSum += distance;
+        if (distance <= 36)
+            ++flatNearCount;
+    }
+    const double flatNearRatio = backgroundSamples.isEmpty()
+        ? 0.0
+        : static_cast<double>(flatNearCount) / backgroundSamples.size();
+    const double flatAverageDistance = backgroundSamples.isEmpty()
+        ? 999.0
+        : static_cast<double>(flatDistanceSum) / backgroundSamples.size();
+    const bool flatColorBackgroundBySamples = backgroundSamples.size() >= qMax(12, width * height / 8)
+        && flatNearRatio >= 0.82
+        && flatAverageDistance <= 24.0;
+    const bool flatColorBackground = flatColorBackgroundBySamples || dominantColorBackground;
+    const QColor repairBackground = flatColorBackgroundBySamples ? flatBackground : dominantBackground;
+
+    if (flatColorBackground) {
+        const int flatLum = luminance(repairBackground);
+        for (int y = bounded.top(); y <= bounded.bottom(); ++y) {
+            for (int x = bounded.left(); x <= bounded.right(); ++x) {
+                const int index = (y - bounded.top()) * width + (x - bounded.left());
+                const QColor pixel = original.pixelColor(x, y);
+                const int distance = colorDistance(pixel, repairBackground);
+                const int lum = luminance(pixel);
+                const bool darkOnFlat = lum <= flatLum - 10;
+                const bool lightOnFlat = lum >= flatLum + 10;
+                const bool colorShiftOnFlat = distance >= 22 && qAbs(lum - flatLum) >= 8;
+                if ((darkOnFlat || lightOnFlat || colorShiftOnFlat) && distance >= 22)
+                    textMask[index] = 1;
+            }
+        }
+    }
+
+    QVector<uchar> eraseMask = textMask;
+    const int dilateRadius = flatColorBackground
+        ? qBound(1, qMin(width, height) / 30, 3)
+        : qBound(1, qMin(width, height) / 36, 2);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            if (!textMask[y * width + x])
+                continue;
+
+            for (int yy = qMax(0, y - dilateRadius); yy <= qMin(height - 1, y + dilateRadius); ++yy) {
+                for (int xx = qMax(0, x - dilateRadius); xx <= qMin(width - 1, x + dilateRadius); ++xx)
+                    eraseMask[yy * width + xx] = 1;
+            }
+        }
+    }
+
+    for (int y = bounded.top(); y <= bounded.bottom(); ++y) {
+        for (int x = bounded.left(); x <= bounded.right(); ++x) {
+            const int index = (y - bounded.top()) * width + (x - bounded.left());
+            if (!eraseMask.at(index))
+                continue;
+
+            if (flatColorBackground) {
+                image.setPixelColor(x, y, repairBackground);
+                continue;
+            }
+
+            const int localMargin = qBound(4, qMin(width, height) / 12, 10);
+            QVector<QColor> nearby;
+            const QRect around(x - localMargin, y - localMargin, localMargin * 2 + 1, localMargin * 2 + 1);
+            const QRect clipped = around.intersected(bounded);
+            for (int yy = clipped.top(); yy <= clipped.bottom(); ++yy) {
+                for (int xx = clipped.left(); xx <= clipped.right(); ++xx) {
+                    const int nearbyIndex = (yy - bounded.top()) * width + (xx - bounded.left());
+                    if (!eraseMask.at(nearbyIndex))
+                        nearby.append(original.pixelColor(xx, yy));
+                }
+            }
+
+            QColor repaired = medianColor(nearby, estimatedFill.at(index));
+            repaired = mixColor(repaired, estimatedFill.at(index), 0.25);
+            image.setPixelColor(x, y, repaired);
         }
     }
 }
@@ -357,7 +862,7 @@ QString PptxExporter::buildAppXml() const
 {
     return QStringLiteral(R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">
-  <Application>Image2PPT</Application>
+  <Application>ImageToPPT</Application>
   <PresentationFormat>Custom</PresentationFormat>
   <Slides>1</Slides>
   <Notes>0</Notes>
@@ -372,9 +877,9 @@ QString PptxExporter::buildCoreXml() const
 {
     return QStringLiteral(R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-  <dc:title>Image2PPT Export</dc:title>
-  <dc:creator>Image2PPT</dc:creator>
-  <cp:lastModifiedBy>Image2PPT</cp:lastModifiedBy>
+  <dc:title>ImageToPPT Export</dc:title>
+  <dc:creator>ImageToPPT</dc:creator>
+  <cp:lastModifiedBy>ImageToPPT</cp:lastModifiedBy>
 </cp:coreProperties>
 )");
 }
@@ -542,12 +1047,16 @@ QString PptxExporter::buildSlideXml(const QImage &sourceImage,
             <a:r>
               <a:rPr lang="zh-CN" sz="%1" b="%2">
                 <a:solidFill><a:srgbClr val="%3"/></a:solidFill>
-                <a:latin typeface="Microsoft YaHei"/>
-                <a:ea typeface="Microsoft YaHei"/>
+                <a:latin typeface="%5"/>
+                <a:ea typeface="%5"/>
               </a:rPr>
-              <a:t>%4</a:t>
+              <a:t>%6</a:t>
             </a:r>
-          </a:p>)").arg(fontSize).arg(bold).arg(colorToHex(region.textColor), xmlEscape(line));
+          </a:p>)").arg(fontSize)
+                 .arg(bold)
+                 .arg(colorToHex(region.textColor))
+                 .arg(xmlEscape(region.fontFamily.isEmpty() ? QStringLiteral("Microsoft YaHei") : region.fontFamily))
+                 .arg(xmlEscape(line));
             }
 
             shapes += QStringLiteral(R"(
@@ -626,7 +1135,7 @@ QString PptxExporter::buildSlideRels(int imageCount, bool includeOriginalBackgro
 QString PptxExporter::buildThemeXml() const
 {
     return QStringLiteral(R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Image2PPT">
+<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="ImageToPPT">
   <a:themeElements>
     <a:clrScheme name="Office">
       <a:dk1><a:srgbClr val="000000"/></a:dk1>
@@ -642,11 +1151,11 @@ QString PptxExporter::buildThemeXml() const
       <a:hlink><a:srgbClr val="0563C1"/></a:hlink>
       <a:folHlink><a:srgbClr val="954F72"/></a:folHlink>
     </a:clrScheme>
-    <a:fontScheme name="Image2PPT">
+    <a:fontScheme name="ImageToPPT">
       <a:majorFont><a:latin typeface="Microsoft YaHei"/><a:ea typeface="Microsoft YaHei"/><a:cs typeface="Arial"/></a:majorFont>
       <a:minorFont><a:latin typeface="Microsoft YaHei"/><a:ea typeface="Microsoft YaHei"/><a:cs typeface="Arial"/></a:minorFont>
     </a:fontScheme>
-    <a:fmtScheme name="Image2PPT">
+    <a:fmtScheme name="ImageToPPT">
       <a:fillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:fillStyleLst>
       <a:lnStyleLst><a:ln w="6350"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln></a:lnStyleLst>
       <a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst>

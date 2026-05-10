@@ -1,8 +1,9 @@
 QT += widgets
 
 CONFIG += c++17
+QMAKE_CXXFLAGS += -finput-charset=UTF-8 -fexec-charset=UTF-8
 
-TARGET = Image2Ppt
+TARGET = ImageToPPT
 TEMPLATE = app
 
 SOURCES += \
